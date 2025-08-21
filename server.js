@@ -1,35 +1,37 @@
+// server.js
 require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
 const rateLimit = require("express-rate-limit");
 const { z } = require("zod");
 const bcrypt = require("bcryptjs");
-const { users } = require("./appwrite");
-const { sendEmail } = require("./mailer");
+const { users } = require("./appwrite");   // your Appwrite Admin client helpers
+const { sendEmail } = require("./mailer"); // MUST be (to, subject, text)
 
-// ⬇️ Use the Upstash-backed otpStore (root: ./otpStore.js)
+// ⬇️ Upstash-backed OTP store (root: ./otpStore.js)
+const otpStore = require("./otpStore");
 const {
   putOTP,
   getOTP,
   delOTP,
   canResend,
   markResent,
-  saveOTPEntry,
+  saveOTPEntry, // may be undefined in memory fallback — we guard below
   OTP_TTL_MS = 10 * 60_000,
   RESEND_COOLDOWN_MS = 30_000,
   MAX_RESENDS = 5,
-} = require("./otpStore");
+} = otpStore;
 
-// ✅ CREATE THE APP
+// ✅ APP
 const app = express();
 
 /* -------------------- CORS (minimal + safe) -------------------- */
 // helper to escape strings for RegExp
 const escapeRegex = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
-// Allow these always in dev:
+// Always allow in dev:
 //  - Expo Go (exp://...)
-//  - Localhost any port (e.g. http://localhost:19006)
+//  - Localhost any port (http://localhost:<port>)
 const devOrigins = [/^exp:\/\//, /^http:\/\/localhost:\d+$/];
 
 // In production, set WEB_ORIGINS env as comma-separated list, e.g.:
@@ -38,41 +40,47 @@ const prodOriginList = (process.env.WEB_ORIGINS || "")
   .split(",")
   .map((s) => s.trim())
   .filter(Boolean);
-
-// Build regexes for prod origins
 const prodOrigins = prodOriginList.map((o) => new RegExp("^" + escapeRegex(o) + "$"));
 
-// Final allowlist: dev regex + optional prod domains
+// Final allowlist
 const allowlist = [...devOrigins, ...prodOrigins];
 
-// CORS options: allow non-browser callers (no Origin), and allow if origin matches
 const corsOptions = {
   origin(origin, callback) {
-    // Mobile apps/curl/server-to-server often have no Origin header — allow them
+    // server-to-server / curl / native apps often have no Origin
     if (!origin) return callback(null, true);
     const allowed = allowlist.some((re) => re.test(origin));
     return allowed ? callback(null, true) : callback(new Error("Not allowed by CORS"));
   },
-  // credentials: false // keep default unless you need cookies
 };
 
 app.use(cors(corsOptions));
 /* -------------------------------------------------------------- */
 
-// Other middlewares
 app.use(express.json());
 app.use(rateLimit({ windowMs: 10 * 60_000, max: 60 }));
 
+// Health
 app.get("/health", (_, res) => res.json({ ok: true }));
 
-// Start or resend OTP
-app.post("/auth/otp/start", async (req, res) => {
+/**
+ * POST /auth/otp/start
+ * body: { userId: string }
+ * Sends a 6-digit code to the user's email (looked up via Appwrite).
+ */
+app.post("/auth/otp/start", async (req, res, next) => {
   try {
-    const body = z.object({ userId: z.string().min(1) }).parse(req.body);
-    const u = await users.get(body.userId);
-    const email = (u.email || "").trim();
-    if (!email) return res.json({ ok: true });
+    const body = z.object({ userId: z.string().min(1, "userId required") }).parse(req.body);
 
+    // Fetch user to get email
+    const u = await users.get(body.userId);
+    const email = (u?.email || "").trim();
+    if (!email) {
+      // Silently succeed (avoid enumeration)
+      return res.json({ ok: true });
+    }
+
+    // Do we already have an active OTP?
     const existing = await getOTP(body.userId);
 
     if (existing) {
@@ -90,10 +98,11 @@ app.post("/auth/otp/start", async (req, res) => {
         }
       }
 
+      // resend informational email (same code)
       await sendEmail(
         email,
         "Your password reset code",
-        `Your verification code is still valid. Check your inbox/spam. It expires in 10 minutes from the original send.`
+        `Your verification code is still valid. Check your inbox/spam. It expires 10 minutes from the original send.`
       );
       await markResent(body.userId);
 
@@ -129,45 +138,80 @@ app.post("/auth/otp/start", async (req, res) => {
       resendCooldownMs: RESEND_COOLDOWN_MS,
       maxResends: MAX_RESENDS,
     });
-  } catch (e) {
-    console.error("otp/start error", e);
-    res.status(400).json({ ok: false, error: e.message });
+  } catch (err) {
+    next(err);
   }
 });
 
-// Verify OTP + set new password
-app.post("/auth/otp/verify", async (req, res) => {
+/**
+ * POST /auth/otp/verify
+ * body: { userId: string, otp: string(6), newPassword: string(>=8) }
+ * Verifies OTP, updates Appwrite password, deletes OTP.
+ */
+app.post("/auth/otp/verify", async (req, res, next) => {
   try {
     const body = z
       .object({
-        userId: z.string().min(1),
-        otp: z.string().length(6),
-        newPassword: z.string().min(8),
+        userId: z.string().min(1, "userId required"),
+        otp: z.string().length(6, "otp must be 6 digits"),
+        newPassword: z.string().min(8, "newPassword must be >= 8 chars"),
       })
       .parse(req.body);
 
+    // Read OTP entry (Upstash is async; memory fallback returns value — await works for both)
     const entry = await getOTP(body.userId);
-    if (!entry) return res.status(400).json({ ok: false, error: "expired" });
+    if (!entry) {
+      return res.status(400).json({ ok: false, error: "expired" });
+    }
 
-    // increment attempts and persist to Redis so it survives restarts/races
+    // Track attempts and persist (if store supports it)
     entry.attempts = (entry.attempts || 0) + 1;
-    await saveOTPEntry(body.userId, entry);
+    if (typeof saveOTPEntry === "function") {
+      await saveOTPEntry(body.userId, entry);
+    }
 
     if (entry.attempts > 5) {
       await delOTP(body.userId);
       return res.status(429).json({ ok: false, error: "too_many_attempts" });
     }
 
-    const ok = await bcrypt.compare(body.otp, entry.codeHash);
-    if (!ok) return res.status(400).json({ ok: false, error: "invalid_code" });
+    const match = await bcrypt.compare(body.otp, entry.codeHash);
+    if (!match) {
+      return res.status(400).json({ ok: false, error: "invalid_code" });
+    }
 
-    await users.updatePassword(body.userId, body.newPassword);
+    // 🔐 Update Appwrite password
+    try {
+      await users.updatePassword(body.userId, body.newPassword);
+    } catch (e) {
+      const errMsg =
+        (e && e.message) ||
+        (e && e.response && e.response.message) ||
+        (typeof e === "string" ? e : "appwrite_update_failed");
+      return res.status(500).json({ ok: false, error: errMsg });
+    }
+
     await delOTP(body.userId);
+    return res.json({ ok: true });
+  } catch (err) {
+    next(err);
+  }
+});
 
-    res.json({ ok: true });
+// -------- Global JSON error handler (keeps responses valid JSON) --------
+app.use((err, req, res, next) => {
+  try {
+    const status = err?.status || 400;
+    const message =
+      (typeof err?.message === "string" && err.message) ||
+      (typeof err === "string" && err) ||
+      err?.error ||
+      "request_failed";
+    // Log full error for debugging
+    console.error("[ERROR]", err);
+    res.status(status).json({ ok: false, error: message });
   } catch (e) {
-    console.error("otp/verify error", e);
-    res.status(400).json({ ok: false, error: e.message });
+    res.status(500).json({ ok: false, error: "internal_error" });
   }
 });
 
