@@ -241,5 +241,21 @@ app.use((err, req, res, next) => {
   }
 });
 
+if (process.env.DEBUG_OTP === "1") {
+  app.get("/__debug/otp_roundtrip", async (req, res) => {
+    try {
+      const { Redis } = require("@upstash/redis");
+      const r = new Redis({ url: process.env.UPSTASH_REDIS_REST_URL, token: process.env.UPSTASH_REDIS_REST_TOKEN });
+      const key = "otp:__debug";
+      await r.set(key, JSON.stringify({ ok: true, t: Date.now() }), { px: 30000 });
+      const raw = await r.get(key);
+      res.json({ ok: true, raw });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: String(e?.message || e) });
+    }
+  });
+}
+
+
 const PORT = Number(process.env.PORT || 3001);
 app.listen(PORT, () => console.log(`🟢 OTP backend running on :${PORT}`));

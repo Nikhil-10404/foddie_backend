@@ -11,6 +11,13 @@ const redis = new Redis({
   token: process.env.UPSTASH_REDIS_REST_TOKEN,
 });
 
+if (!process.env.UPSTASH_REDIS_REST_URL || !process.env.UPSTASH_REDIS_REST_TOKEN) {
+  console.warn("[OTP] Upstash env missing. Using in-memory store (NOT SAFE FOR PROD).");
+} else {
+  console.log("[OTP] Using Upstash Redis:", process.env.UPSTASH_REDIS_REST_URL);
+}
+
+
 const keyFor = (userId) => `otp:${userId}`;
 
 function safeParse(json) {
