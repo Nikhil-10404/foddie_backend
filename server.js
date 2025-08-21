@@ -256,6 +256,53 @@ if (process.env.DEBUG_OTP === "1") {
   });
 }
 
+// ---- Admin email update (no client session required) ----
+app.post("/auth/account/update-email", async (req, res) => {
+  try {
+    const body = req.body || {};
+    const userId = typeof body.userId === "string" ? body.userId.trim() : "";
+    const newEmail = typeof body.newEmail === "string" ? body.newEmail.trim() : "";
+    const userDocId = typeof body.userDocId === "string" ? body.userDocId.trim() : ""; // optional
+
+    if (!userId) return res.status(400).json({ ok: false, error: "userId_required" });
+    if (!newEmail) return res.status(400).json({ ok: false, error: "email_required" });
+
+    // 1) Update Appwrite Account (admin)
+    try {
+      await users.updateEmail(userId, newEmail);
+    } catch (e) {
+      const msg =
+        (e && e.message) ||
+        (e && e.response && e.response.message) ||
+        (typeof e === "string" ? e : "users.updateEmail_failed");
+      return res.status(500).json({ ok: false, error: "users.updateEmail_failed", detail: String(msg) });
+    }
+
+    // 2) Mirror to Users collection if doc id provided
+    if (userDocId) {
+      try {
+        const { databases } = require("./appwrite");
+        const { appwriteConfig } = require("./appwrite");
+        await databases.updateDocument(
+          appwriteConfig.databaseId,
+          appwriteConfig.userCollectionId,
+          userDocId,
+          { email: newEmail }
+        );
+      } catch (e) {
+        const msg = (e && e.message) || (typeof e === "string" ? e : "mirror_failed");
+        // Non-fatal: email changed at source; report warning
+        return res.status(200).json({ ok: true, warning: "mirror_failed", detail: String(msg) });
+      }
+    }
+
+    return res.json({ ok: true });
+  } catch (e) {
+    const msg = (e && e.message) || (typeof e === "string" ? e : "update_email_failed");
+    return res.status(400).json({ ok: false, error: String(msg) });
+  }
+});
+
 
 const PORT = Number(process.env.PORT || 3001);
 app.listen(PORT, () => console.log(`🟢 OTP backend running on :${PORT}`));
