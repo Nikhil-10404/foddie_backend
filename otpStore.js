@@ -1,13 +1,23 @@
-// otpStore.js
+// otpStore.js  (root, same folder as server.js)
+const { Redis } = require("@upstash/redis");
 const bcrypt = require("bcryptjs");
 
-const store = new Map(); // userId -> entry
+const redis = new Redis({
+  url: process.env.UPSTASH_REDIS_REST_URL,
+  token: process.env.UPSTASH_REDIS_REST_TOKEN,
+});
 
-// TTLs & cooldowns (tweak to taste)
-const OTP_TTL_MS = 10 * 60_000;    // 10 minutes validity
-const RESEND_COOLDOWN_MS = 30_000; // 30s between sends
-const MAX_RESENDS = 5;             // per OTP window
+// Keep same config names your server.js expects
+const OTP_TTL_MS = Number(process.env.OTP_TTL_MS || 10 * 60_000);        // 10 min
+const RESEND_COOLDOWN_MS = Number(process.env.RESEND_COOLDOWN_MS || 30_000);
+const MAX_RESENDS = Number(process.env.MAX_RESENDS || 5);
 
+// Keys
+const kCode = (userId) => `otp:code:${userId}`;     // hashed code
+const kMeta = (userId) => `otp:meta:${userId}`;     // JSON: { email, expiresAt, attempts, lastSentAt, resendCount }
+const kCd   = (userId) => `otp:cooldown:${userId}`; // throttle resend
+
+// Create or overwrite OTP entry
 async function putOTP(userId, email, code) {
   const codeHash = await bcrypt.hash(code, 10);
   const now = Date.now();
@@ -19,43 +29,80 @@ async function putOTP(userId, email, code) {
     lastSentAt: now,
     resendCount: 0,
   };
-  store.set(userId, entry);
+
+  // store both with TTL
+  await Promise.all([
+    redis.set(kCode(userId), codeHash, { px: OTP_TTL_MS }),
+    redis.set(kMeta(userId), JSON.stringify(entry), { px: OTP_TTL_MS }),
+    redis.set(kCd(userId), "1", { px: RESEND_COOLDOWN_MS }), // start cooldown immediately
+  ]);
+
   return entry;
 }
 
-function getOTP(userId) {
-  const e = store.get(userId);
-  if (!e) return null;
-  if (Date.now() > e.expiresAt) { store.delete(userId); return null; }
-  return e;
+// Read current entry (null if missing/expired). Auto-clean if expired.
+async function getOTP(userId) {
+  const [metaStr] = await Promise.all([redis.get(kMeta(userId))]);
+  if (!metaStr) return null;
+
+  const entry = JSON.parse(metaStr);
+  if (Date.now() > entry.expiresAt) {
+    await delOTP(userId);
+    return null;
+  }
+  return entry;
 }
 
-function delOTP(userId) { store.delete(userId); }
+// Persist an updated entry with the remaining TTL (used for attempts/resends)
+async function saveOTPEntry(userId, entry) {
+  const ttl = await redis.pttl(kMeta(userId));
+  const px = ttl > 0 ? ttl : OTP_TTL_MS;
+  await Promise.all([
+    redis.set(kMeta(userId), JSON.stringify(entry), { px }),
+    // keep code key alive the same remaining time
+    redis.pexpire(kCode(userId), px),
+  ]);
+}
 
-function canResend(userId) {
-  const e = store.get(userId);
-  if (!e) return { ok: true }; // treat as ok; caller will create new one
-  const now = Date.now();
+// Delete everything
+async function delOTP(userId) {
+  await Promise.all([redis.del(kCode(userId)), redis.del(kMeta(userId)), redis.del(kCd(userId))]);
+}
 
-  if (now - e.lastSentAt < RESEND_COOLDOWN_MS) {
-    return { ok: false, reason: "cooldown", retryInMs: RESEND_COOLDOWN_MS - (now - e.lastSentAt) };
+// Resend throttle + limits
+async function canResend(userId) {
+  // cooldown?
+  const ttl = await redis.pttl(kCd(userId));
+  if (typeof ttl === "number" && ttl > 0) {
+    return { ok: false, reason: "cooldown", retryInMs: ttl };
   }
-  if (e.resendCount >= MAX_RESENDS) {
-    return { ok: false, reason: "limit" };
-  }
+
+  // check resend count in meta
+  const metaStr = await redis.get(kMeta(userId));
+  if (!metaStr) return { ok: true }; // no active OTP -> you'll create a new one anyway
+  const entry = JSON.parse(metaStr);
+  if ((entry.resendCount || 0) >= MAX_RESENDS) return { ok: false, reason: "limit" };
   return { ok: true };
 }
 
-function markResent(userId) {
-  const e = store.get(userId);
-  if (!e) return;
-  e.resendCount += 1;
-  e.lastSentAt = Date.now();
+async function markResent(userId) {
+  const metaStr = await redis.get(kMeta(userId));
+  if (!metaStr) return;
+  const entry = JSON.parse(metaStr);
+  entry.resendCount = (entry.resendCount || 0) + 1;
+  entry.lastSentAt = Date.now();
+  await saveOTPEntry(userId, entry);
+  await redis.set(kCd(userId), "1", { px: RESEND_COOLDOWN_MS }); // re-arm cooldown
 }
 
 module.exports = {
-  putOTP, getOTP, delOTP,
-  canResend, markResent,
-  // export constants so UI can mirror timers if you want
-  OTP_TTL_MS, RESEND_COOLDOWN_MS, MAX_RESENDS
+  putOTP,
+  getOTP,
+  delOTP,
+  canResend,
+  markResent,
+  saveOTPEntry,            // <-- you'll call this once in server.js to persist attempts
+  OTP_TTL_MS,
+  RESEND_COOLDOWN_MS,
+  MAX_RESENDS,
 };

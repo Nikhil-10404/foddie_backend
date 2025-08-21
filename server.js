@@ -6,40 +6,19 @@ const { z } = require("zod");
 const bcrypt = require("bcryptjs");
 const { users } = require("./appwrite");
 const { sendEmail } = require("./mailer");
+
+// ⬇️ Use the Upstash-backed otpStore (root: ./otpStore.js)
 const {
-  putOTP, getOTP, delOTP, canResend, markResent,
-  OTP_TTL_MS = 10 * 60_000, RESEND_COOLDOWN_MS = 30_000, MAX_RESENDS = 5
-} = (() => {
-  // fallback if your otpStore doesn't export cooldown helpers yet
-  try { return require("./otpStore"); }
-  catch {
-    const store = new Map();
-    return {
-      putOTP: async (userId, email, code) => {
-        const codeHash = await bcrypt.hash(code, 10);
-        const now = Date.now();
-        const entry = { email, codeHash, expiresAt: now + OTP_TTL_MS, attempts: 0, lastSentAt: now, resendCount: 0 };
-        store.set(userId, entry);
-        return entry;
-      },
-      getOTP: (userId) => {
-        const e = store.get(userId); if (!e) return null;
-        if (Date.now() > e.expiresAt) { store.delete(userId); return null; }
-        return e;
-      },
-      delOTP: (userId) => store.delete(userId),
-      canResend: (userId) => {
-        const e = store.get(userId); if (!e) return { ok: true };
-        const now = Date.now();
-        if (now - e.lastSentAt < RESEND_COOLDOWN_MS) return { ok: false, reason: "cooldown", retryInMs: RESEND_COOLDOWN_MS - (now - e.lastSentAt) };
-        if (e.resendCount >= MAX_RESENDS) return { ok: false, reason: "limit" };
-        return { ok: true };
-      },
-      markResent: (userId) => { const e = store.get(userId); if (e) { e.resendCount++; e.lastSentAt = Date.now(); } },
-      OTP_TTL_MS, RESEND_COOLDOWN_MS, MAX_RESENDS,
-    };
-  }
-})();
+  putOTP,
+  getOTP,
+  delOTP,
+  canResend,
+  markResent,
+  saveOTPEntry,
+  OTP_TTL_MS = 10 * 60_000,
+  RESEND_COOLDOWN_MS = 30_000,
+  MAX_RESENDS = 5,
+} = require("./otpStore");
 
 // ✅ CREATE THE APP
 const app = express();
@@ -94,37 +73,53 @@ app.post("/auth/otp/start", async (req, res) => {
     const email = (u.email || "").trim();
     if (!email) return res.json({ ok: true });
 
-    const existing = getOTP(body.userId);
-    let entry = existing;
+    const existing = await getOTP(body.userId);
 
     if (existing) {
-      const gate = canResend(body.userId);
+      const gate = await canResend(body.userId);
       if (!gate.ok) {
         if (gate.reason === "cooldown") {
-          return res
-            .status(429)
-            .json({ ok: false, error: "Please wait before requesting another code.", retryInMs: gate.retryInMs });
+          return res.status(429).json({
+            ok: false,
+            error: "Please wait before requesting another code.",
+            retryInMs: gate.retryInMs,
+          });
         }
         if (gate.reason === "limit") {
           return res.status(429).json({ ok: false, error: "Too many resends. Please try again later." });
         }
       }
+
       await sendEmail(
         email,
         "Your password reset code",
         `Your verification code is still valid. Check your inbox/spam. It expires in 10 minutes from the original send.`
       );
-      markResent(body.userId);
-    } else {
-      const code = String(Math.floor(100000 + Math.random() * 900000));
-      entry = await putOTP(body.userId, email, code);
-      if (process.env.NODE_ENV !== "production") console.log(`DEV OTP for ${email}: ${code}`);
-      await sendEmail(
-        email,
-        "Your password reset code",
-        `Your verification code is ${code}. It expires in 10 minutes.`
-      );
+      await markResent(body.userId);
+
+      const expiresInMs = Math.max(0, existing.expiresAt - Date.now());
+      return res.json({
+        ok: true,
+        expiresInMs,
+        ttlMs: OTP_TTL_MS,
+        resendCooldownMs: RESEND_COOLDOWN_MS,
+        maxResends: MAX_RESENDS,
+      });
     }
+
+    // No existing OTP — create a new one
+    const code = String(Math.floor(100000 + Math.random() * 900000));
+    const entry = await putOTP(body.userId, email, code);
+
+    if (process.env.NODE_ENV !== "production") {
+      console.log(`DEV OTP for ${email}: ${code}`);
+    }
+
+    await sendEmail(
+      email,
+      "Your password reset code",
+      `Your verification code is ${code}. It expires in 10 minutes.`
+    );
 
     const expiresInMs = Math.max(0, entry.expiresAt - Date.now());
     return res.json({
@@ -151,12 +146,15 @@ app.post("/auth/otp/verify", async (req, res) => {
       })
       .parse(req.body);
 
-    const entry = getOTP(body.userId);
+    const entry = await getOTP(body.userId);
     if (!entry) return res.status(400).json({ ok: false, error: "expired" });
 
+    // increment attempts and persist to Redis so it survives restarts/races
     entry.attempts = (entry.attempts || 0) + 1;
+    await saveOTPEntry(body.userId, entry);
+
     if (entry.attempts > 5) {
-      delOTP(body.userId);
+      await delOTP(body.userId);
       return res.status(429).json({ ok: false, error: "too_many_attempts" });
     }
 
@@ -164,7 +162,8 @@ app.post("/auth/otp/verify", async (req, res) => {
     if (!ok) return res.status(400).json({ ok: false, error: "invalid_code" });
 
     await users.updatePassword(body.userId, body.newPassword);
-    delOTP(body.userId);
+    await delOTP(body.userId);
+
     res.json({ ok: true });
   } catch (e) {
     console.error("otp/verify error", e);
