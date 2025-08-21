@@ -2,8 +2,21 @@
 const { Redis } = require("@upstash/redis");
 const bcrypt = require("bcryptjs");
 
-const OTP_TTL_MS = Number(process.env.OTP_TTL_MS || 10 * 60_000);
-const RESEND_COOLDOWN_MS = Number(process.env.RESEND_COOLDOWN_MS || 30_000);
+// Support both *MS and *SECONDS envs
+const OTP_TTL_MS =
+  process.env.OTP_TTL_MS
+    ? Number(process.env.OTP_TTL_MS)
+    : process.env.OTP_TTL_SECONDS
+      ? Number(process.env.OTP_TTL_SECONDS) * 1000
+      : 10 * 60_000; // default 10 min
+
+const RESEND_COOLDOWN_MS =
+  process.env.RESEND_COOLDOWN_MS
+    ? Number(process.env.RESEND_COOLDOWN_MS)
+    : process.env.OTP_RESEND_COOLDOWN
+      ? Number(process.env.OTP_RESEND_COOLDOWN) * 1000
+      : 30_000; // default 30s
+
 const MAX_RESENDS = Number(process.env.MAX_RESENDS || 5);
 
 const redis = new Redis({
@@ -11,32 +24,26 @@ const redis = new Redis({
   token: process.env.UPSTASH_REDIS_REST_TOKEN,
 });
 
+// Log which backend we use
 if (!process.env.UPSTASH_REDIS_REST_URL || !process.env.UPSTASH_REDIS_REST_TOKEN) {
   console.warn("[OTP] Upstash env missing. Using in-memory store (NOT SAFE FOR PROD).");
 } else {
   console.log("[OTP] Using Upstash Redis:", process.env.UPSTASH_REDIS_REST_URL);
 }
 
-
 const keyFor = (userId) => `otp:${userId}`;
 
-function safeParse(json) {
-  if (json == null) return null;
-  if (typeof json !== "string") {
-    // If someone mistakenly wrote a raw object with a different client,
-    // bail out and let caller treat as missing/expired.
-    return null;
+// ✅ Accept object OR string (Upstash may auto-JSON decode)
+function coerceEntry(value) {
+  if (value == null) return null;
+  if (typeof value === "object") return value; // already parsed by Upstash SDK
+  if (typeof value === "string") {
+    try { return JSON.parse(value); } catch { return null; }
   }
-  try {
-    return JSON.parse(json);
-  } catch {
-    return null;
-  }
+  return null;
 }
 
-/**
- * Save entry back to Redis with the remaining TTL.
- */
+/** Save entry back with remaining TTL */
 async function saveOTPEntry(userId, entry) {
   const remaining = Math.max(0, (entry.expiresAt || 0) - Date.now());
   if (remaining <= 0) {
@@ -46,9 +53,7 @@ async function saveOTPEntry(userId, entry) {
   await redis.set(keyFor(userId), JSON.stringify(entry), { px: remaining });
 }
 
-/**
- * Create/store a new OTP entry for user.
- */
+/** Create/store a new OTP entry */
 async function putOTP(userId, email, code) {
   const now = Date.now();
   const codeHash = await bcrypt.hash(code, 10);
@@ -64,16 +69,12 @@ async function putOTP(userId, email, code) {
   return entry;
 }
 
-/**
- * Read the OTP entry; return null if expired or malformed.
- * Auto-heals bad legacy values by deleting them.
- */
+/** Read OTP entry; return null if expired/malformed (and clean up bad legacy values) */
 async function getOTP(userId) {
   const raw = await redis.get(keyFor(userId));
-  const entry = safeParse(raw);
+  const entry = coerceEntry(raw);
   if (!entry) {
-    // Delete bad/legacy value like "[object Object]" so a new code fixes it.
-    if (raw) await redis.del(keyFor(userId));
+    if (raw) await redis.del(keyFor(userId)); // clean malformed legacy values
     return null;
   }
   if (Date.now() > (entry.expiresAt || 0)) {
@@ -87,9 +88,7 @@ async function delOTP(userId) {
   await redis.del(keyFor(userId));
 }
 
-/**
- * Enforce resend cooldown and max resend limit.
- */
+/** Enforce resend cooldown / max resends */
 async function canResend(userId) {
   const entry = await getOTP(userId);
   if (!entry) return { ok: true };
