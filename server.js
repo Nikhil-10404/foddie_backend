@@ -3,10 +3,10 @@ require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
 const rateLimit = require("express-rate-limit");
-const { z } = require("zod");
+const { z } = require("zod"); // still used in /start (simple)
 const bcrypt = require("bcryptjs");
-const { users } = require("./appwrite");   // your Appwrite Admin client helpers
-const { sendEmail } = require("./mailer"); // MUST be (to, subject, text)
+const { users } = require("./appwrite");   // Appwrite Admin client helpers
+const { sendEmail } = require("./mailer"); // (to, subject, text)
 
 // ⬇️ Upstash-backed OTP store (root: ./otpStore.js)
 const otpStore = require("./otpStore");
@@ -67,16 +67,21 @@ app.get("/health", (_, res) => res.json({ ok: true }));
  * POST /auth/otp/start
  * body: { userId: string }
  * Sends a 6-digit code to the user's email (looked up via Appwrite).
+ * If user not found / no email, returns ok:true silently (avoid enumeration).
  */
 app.post("/auth/otp/start", async (req, res, next) => {
   try {
     const body = z.object({ userId: z.string().min(1, "userId required") }).parse(req.body);
 
-    // Fetch user to get email
-    const u = await users.get(body.userId);
-    const email = (u?.email || "").trim();
+    // Try to fetch user; silently succeed if not found or permission error
+    let email = "";
+    try {
+      const u = await users.get(body.userId);
+      email = (u?.email || "").trim();
+    } catch {
+      return res.json({ ok: true });
+    }
     if (!email) {
-      // Silently succeed (avoid enumeration)
       return res.json({ ok: true });
     }
 
@@ -144,58 +149,79 @@ app.post("/auth/otp/start", async (req, res, next) => {
 });
 
 /**
- * POST /auth/otp/verify
+ * POST /auth/otp/verify  (defensive version — no Zod)
  * body: { userId: string, otp: string(6), newPassword: string(>=8) }
  * Verifies OTP, updates Appwrite password, deletes OTP.
+ * Always returns clean JSON (no "[object Object]").
  */
-app.post("/auth/otp/verify", async (req, res, next) => {
+app.post("/auth/otp/verify", async (req, res) => {
+  // 1) Manual validation (avoid parser-side JSON errors)
+  const body = req.body || {};
+  const userId = typeof body.userId === "string" ? body.userId.trim() : "";
+  const otp = typeof body.otp === "string" ? body.otp.trim() : "";
+  const newPassword = typeof body.newPassword === "string" ? body.newPassword : "";
+
+  if (!userId) return res.status(400).json({ ok: false, error: "userId_required" });
+  if (!/^\d{6}$/.test(otp)) return res.status(400).json({ ok: false, error: "otp_invalid_format" });
+  if (newPassword.length < 8) return res.status(400).json({ ok: false, error: "password_too_short" });
+
+  // 2) Read OTP entry
+  let entry;
   try {
-    const body = z
-      .object({
-        userId: z.string().min(1, "userId required"),
-        otp: z.string().length(6, "otp must be 6 digits"),
-        newPassword: z.string().min(8, "newPassword must be >= 8 chars"),
-      })
-      .parse(req.body);
+    entry = await getOTP(userId);
+  } catch (e) {
+    const msg = (e && e.message) || (typeof e === "string" ? e : "otp_read_failed");
+    return res.status(500).json({ ok: false, error: "otp_read_failed", detail: String(msg) });
+  }
+  if (!entry) return res.status(400).json({ ok: false, error: "expired" });
 
-    // Read OTP entry (Upstash is async; memory fallback returns value — await works for both)
-    const entry = await getOTP(body.userId);
-    if (!entry) {
-      return res.status(400).json({ ok: false, error: "expired" });
-    }
-
-    // Track attempts and persist (if store supports it)
+  // 3) Track attempts (and persist if supported)
+  try {
     entry.attempts = (entry.attempts || 0) + 1;
     if (typeof saveOTPEntry === "function") {
-      await saveOTPEntry(body.userId, entry);
+      await saveOTPEntry(userId, entry);
     }
-
     if (entry.attempts > 5) {
-      await delOTP(body.userId);
+      await delOTP(userId);
       return res.status(429).json({ ok: false, error: "too_many_attempts" });
     }
-
-    const match = await bcrypt.compare(body.otp, entry.codeHash);
-    if (!match) {
-      return res.status(400).json({ ok: false, error: "invalid_code" });
-    }
-
-    // 🔐 Update Appwrite password
-    try {
-      await users.updatePassword(body.userId, body.newPassword);
-    } catch (e) {
-      const errMsg =
-        (e && e.message) ||
-        (e && e.response && e.response.message) ||
-        (typeof e === "string" ? e : "appwrite_update_failed");
-      return res.status(500).json({ ok: false, error: errMsg });
-    }
-
-    await delOTP(body.userId);
-    return res.json({ ok: true });
-  } catch (err) {
-    next(err);
+  } catch (e) {
+    const msg = (e && e.message) || (typeof e === "string" ? e : "otp_attempts_failed");
+    return res.status(500).json({ ok: false, error: "otp_attempts_failed", detail: String(msg) });
   }
+
+  // 4) Compare codes
+  let match = false;
+  try {
+    match = await bcrypt.compare(otp, entry.codeHash);
+  } catch (e) {
+    const msg = (e && e.message) || (typeof e === "string" ? e : "bcrypt_error");
+    return res.status(500).json({ ok: false, error: "bcrypt_error", detail: String(msg) });
+  }
+  if (!match) return res.status(400).json({ ok: false, error: "invalid_code" });
+
+  // 5) Update Appwrite password
+  try {
+    await users.updatePassword(userId, newPassword);
+  } catch (e) {
+    // Appwrite sometimes throws rich objects — normalize to string
+    const msg =
+      (e && e.message) ||
+      (e && e.response && e.response.message) ||
+      (typeof e === "string" ? e : JSON.stringify(e));
+    return res.status(500).json({ ok: false, error: "appwrite_update_failed", detail: String(msg) });
+  }
+
+  // 6) Clean up OTP
+  try {
+    await delOTP(userId);
+  } catch (e) {
+    const msg = (e && e.message) || (typeof e === "string" ? e : "otp_delete_failed");
+    // Non-fatal cleanup error
+    return res.status(200).json({ ok: true, warning: "otp_delete_failed", detail: String(msg) });
+  }
+
+  return res.json({ ok: true });
 });
 
 // -------- Global JSON error handler (keeps responses valid JSON) --------
